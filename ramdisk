@@ -1,0 +1,71 @@
+#!/bin/bash
+# macOS RAM disk helper; compatible with the system Bash 3.2.
+set -euo pipefail
+
+fail() { printf 'ramdisk: %s\n' "$*" >&2; exit 1; }
+usage() { printf 'Usage: ramdisk mount 4g | ramdisk umount\n'; }
+
+case "${1:-}" in
+  -h|--help|help) usage; exit 0 ;;
+  -V|--version) printf 'ramdisk 0.1.0\n'; exit 0 ;;
+  mount) [[ $# == 2 ]] || { usage >&2; exit 1; } ;;
+  umount|unmount) [[ $# == 1 ]] || { usage >&2; exit 1; } ;;
+  *) usage >&2; exit 1 ;;
+esac
+[[ $(uname -s) == Darwin ]] || fail 'macOS is required.'
+
+state_dir="${TMPDIR:-/tmp}/ramdisk-$UID"
+mountpoint=/Volumes/RAMDisk
+umask 077
+mkdir -p "$state_dir"
+# Serialize mount/umount invocations.
+mkdir "$state_dir/lock" 2>/dev/null || fail "Another command is running (lock: $state_dir/lock)."
+trap 'rmdir "$state_dir/lock"' EXIT
+
+volume_uuid() {
+  diskutil info -plist "$1" | plutil -extract VolumeUUID raw -o - -
+}
+
+case "$1" in
+  mount)
+    [[ ! -e "$state_dir/device" ]] || fail 'A disk is already recorded; run ramdisk umount first.'
+    [[ ! -e "$mountpoint" ]] || fail "$mountpoint already exists."
+    [[ "$2" =~ ^([1-9][0-9]{0,5})([mMgG])$ ]] || fail 'Use an integer size such as 512m or 4g.'
+    amount=${BASH_REMATCH[1]}
+    case ${BASH_REMATCH[2]} in
+      m|M) bytes=$((amount * 1024 * 1024)) ;;
+      g|G) bytes=$((amount * 1024 * 1024 * 1024)) ;;
+    esac
+    physical=$(sysctl -n hw.memsize)
+    (( bytes < physical )) || fail 'Size must be smaller than physical RAM; leave memory for macOS and apps.'
+    device=$(diskutil image --plist attach --noMount "ram://$((bytes / 512))" |\
+      plutil -extract system-entities.0.dev-entry raw -o - -)
+    [[ $device == /dev/* ]] || device="/dev/$device"
+    [[ "$device" =~ ^/dev/disk[0-9]+$ ]] || fail "Unexpected device: $device"
+    if ! diskutil eraseVolume HFS+ RAMDisk "$device"; then
+      diskutil eject "$device" || true
+      fail 'Formatting failed.'
+    fi
+    if ! uuid=$(volume_uuid "$mountpoint"); then
+      diskutil eject "$device" || true
+      fail 'Could not read the new volume identity.'
+    fi
+    printf '%s\n%s\n' "$device" "$uuid" > "$state_dir/device"
+    printf 'Mounted %s at %s. Files disappear when detached.\n' "$2" "$mountpoint"
+    ;;
+  umount|unmount)
+    [[ -f "$state_dir/device" ]] || fail 'No RAM disk is recorded.'
+    { IFS= read -r device; IFS= read -r expected_uuid; } < "$state_dir/device"
+    [[ "$device" =~ ^/dev/disk[0-9]+$ && -n "$expected_uuid" ]] || fail 'Invalid state file.'
+    if [[ ! -e "$device" ]]; then
+      rm "$state_dir/device"
+      printf 'RAM disk is already detached; cleared its record.\n'
+      exit 0
+    fi
+    actual_uuid=$(volume_uuid "$device") || fail 'Cannot verify disk identity; refusing to detach.'
+    [[ "$actual_uuid" == "$expected_uuid" ]] || fail 'Disk identity changed; refusing to detach.'
+    diskutil eject "$device"
+    rm "$state_dir/device"
+    printf 'RAM disk detached.\n'
+    ;;
+esac

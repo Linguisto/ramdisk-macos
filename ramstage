@@ -1,0 +1,164 @@
+#!/bin/bash
+# macOS, including its system Bash 3.2. ramunstage is a symlink to this file.
+set -euo pipefail
+umask 077
+
+fail() { printf 'ramstage: %s\n' "$*" >&2; exit 1; }
+usage() {
+  cat <<'EOF'
+Usage: ramstage [--size 4g] compressed-image
+       ramunstage
+
+Accepts XZ, gzip, bzip2 and Zstandard, detected by content.
+XZ: automatic size with filesystem overhead, rounded up to MiB/GiB.
+Other formats: --size is required. Explicit size always overrides automatic size.
+Sizes are positive integers with m/g suffixes (MiB/GiB).
+Only the resulting file path is printed to stdout; diagnostics go to stderr.
+EOF
+}
+
+action=stage
+[[ ${0##*/} != ramunstage ]] || action=unstage
+explicit_size=
+source_file=
+while (( $# )); do
+  case "$1" in
+    -h|--help) usage; exit 0 ;;
+    -V|--version) printf 'ramdisk 0.1.0\n'; exit 0 ;;
+    --size)
+      [[ $action == stage && $# -ge 2 ]] || fail '--size requires a value.'
+      [[ -z "$explicit_size" ]] || fail '--size was specified twice.'
+      explicit_size=$2; [[ -n "$explicit_size" ]] || fail '--size requires a value.'
+      shift 2 ;;
+    --size=*)
+      [[ $action == stage && -z "$explicit_size" ]] || fail 'Unexpected --size.'
+      explicit_size=${1#*=}; [[ -n "$explicit_size" ]] || fail '--size requires a value.'
+      shift ;;
+    --) shift; [[ $# == 1 && -z "$source_file" && $action == stage ]] || fail 'Expected one input file.'
+      source_file=$1; shift ;;
+    -*) fail "Unknown option: $1" ;;
+    *) [[ $action == stage && -z "$source_file" ]] || fail 'Unexpected argument.'
+      source_file=$1; shift ;;
+  esac
+done
+[[ $(uname -s) == Darwin ]] || fail 'macOS is required.'
+
+mountpoint=/Volumes/RAMStage
+state_dir="${TMPDIR:-/tmp}/ramstage-$UID"
+mkdir -p "$state_dir"
+mkdir "$state_dir/lock" 2>/dev/null || fail "Another command is running (lock: $state_dir/lock)."
+device=
+rollback=no
+cleanup() {
+  result=$?
+  trap - EXIT
+  if [[ $rollback == yes && -n "$device" ]]; then
+    if diskutil eject "$device" >&2; then
+      rm -f "$state_dir/device"
+    else
+      printf 'ramstage: Cleanup failed for %s; close open files and run ramunstage.\n' "$device" >&2
+    fi
+  fi
+  rmdir "$state_dir/lock"
+  exit "$result"
+}
+trap cleanup EXIT
+trap 'exit 130' INT
+trap 'exit 143' TERM
+trap 'exit 129' HUP
+volume_uuid() {
+  diskutil info -plist "$1" | plutil -extract VolumeUUID raw -o - -
+}
+
+if [[ $action == unstage ]]; then
+  [[ -f "$state_dir/device" ]] || fail 'No staged RAM disk is recorded.'
+  { IFS= read -r device; IFS= read -r expected_uuid; } < "$state_dir/device"
+  [[ "$device" =~ ^/dev/disk[0-9]+$ && -n "$expected_uuid" ]] || fail 'Invalid state file.'
+  if [[ ! -e "$device" ]]; then
+    rm "$state_dir/device"
+    printf 'RAM disk already detached; cleared its record.\n' >&2
+    exit 0
+  fi
+  actual_uuid=$(volume_uuid "$device") || fail 'Cannot verify disk identity; refusing to detach.'
+  [[ $actual_uuid == "$expected_uuid" ]] || fail 'Disk identity changed; refusing to detach.'
+  diskutil eject "$device" >&2
+  rm "$state_dir/device"
+  printf 'RAM disk detached.\n' >&2
+  exit 0
+fi
+
+[[ -n "$source_file" ]] || { usage >&2; exit 1; }
+[[ -f "$source_file" && -r "$source_file" ]] || fail 'Input must be a readable regular file.'
+# Absolute paths also make filenames beginning with a dash safe for decompressors.
+[[ $source_file == /* ]] || source_file="$PWD/$source_file"
+[[ ! -e "$state_dir/device" ]] || fail 'A RAM disk is already recorded; run ramunstage first.'
+[[ ! -e "$mountpoint" && ! -L "$mountpoint" ]] || fail "$mountpoint already exists."
+magic=$(od -An -tx1 -N6 "$source_file" | tr -d '[:space:]')
+case "$magic" in
+  fd377a585a00) decoder=xz ;;
+  1f8b*) decoder=gzip ;;
+  425a68*) decoder=bzip2 ;;
+  28b52ffd*) decoder=zstd ;;
+  *) fail 'Unsupported compression. Expected XZ, gzip, bzip2 or Zstandard; ordinary files are not accepted.' ;;
+esac
+command -v "$decoder" >/dev/null || fail "Install the decompressor: $decoder"
+
+mib=$((1024 * 1024))
+gib=$((1024 * mib))
+expected_bytes=
+if [[ -n "$explicit_size" ]]; then
+  [[ $explicit_size =~ ^([1-9][0-9]{0,5})([mMgG])$ ]] || fail 'Use an integer size such as 512m or 4g.'
+  amount=${BASH_REMATCH[1]}
+  case ${BASH_REMATCH[2]} in
+    m|M) bytes=$((amount * mib)) ;;
+    g|G) bytes=$((amount * gib)) ;;
+  esac
+else
+  [[ $decoder == xz ]] || fail "--size is required for $decoder (for example --size 4g)."
+  expected_bytes=$(LC_ALL=C xz --robot --list -- "$source_file" | awk -F '\t' '$1 == "totals" {print $5}')
+  [[ $expected_bytes =~ ^[0-9]{1,15}$ ]] || fail 'Cannot determine the XZ uncompressed size.'
+  # Reserve at least 16 MiB, or 1%, for HFS+ metadata and allocation overhead.
+  reserve=$(((expected_bytes + 99) / 100))
+  (( reserve >= 16 * mib )) || reserve=$((16 * mib))
+  unit=$mib
+  (( expected_bytes < gib )) || unit=$gib
+  bytes=$((((expected_bytes + reserve + unit - 1) / unit) * unit))
+fi
+physical=$(sysctl -n hw.memsize)
+(( bytes < physical )) || fail 'RAM disk must be smaller than physical RAM; reduce --size or use disk storage.'
+if (( bytes % gib == 0 )); then
+  label="$((bytes / gib)) GiB"
+else
+  label="$((bytes / mib)) MiB"
+fi
+printf 'Creating %s RAM disk at %s (%s).\n' "$label" "$mountpoint" "$decoder" >&2
+device=$(diskutil image --plist attach --noMount "ram://$((bytes / 512))" |\
+  plutil -extract system-entities.0.dev-entry raw -o - -)
+[[ $device == /dev/* ]] || device="/dev/$device"
+[[ $device =~ ^/dev/disk[0-9]+$ ]] || fail "Unexpected device: $device"
+rollback=yes
+diskutil eraseVolume HFS+ RAMStage "$device" >&2
+uuid=$(volume_uuid "$device") || fail 'Could not read the new volume identity.'
+actual_mount=$(diskutil info -plist "$device" | plutil -extract MountPoint raw -o - -)
+[[ $actual_mount == "$mountpoint" ]] || fail "Unexpected mount point: $actual_mount"
+printf '%s\n%s\n' "$device" "$uuid" > "$state_dir/device"
+
+name=${source_file##*/}
+case "$name" in
+  *.xz|*.gz|*.bz2|*.zst|*.zstd) name=${name%.*} ;;
+  *) name="$name.unpacked" ;;
+esac
+[[ -n "$name" && $name != . && $name != .. && $name != *$'\n'* ]] || fail 'Invalid output filename.'
+partial=$(mktemp "$mountpoint/.ramstage.XXXXXXXX")
+printf 'Decompressing %s…\n' "${source_file##*/}" >&2
+if ! "$decoder" -dc "$source_file" > "$partial"; then
+  fail 'Decompression failed (corrupt input or insufficient space).'
+fi
+actual_bytes=$(stat -f %z "$partial")
+(( actual_bytes > 0 )) || fail 'Decompressed file is empty.'
+if [[ -n "$expected_bytes" ]]; then
+  [[ $actual_bytes == "$expected_bytes" ]] || fail 'Decompressed size does not match the XZ index.'
+fi
+mv "$partial" "$mountpoint/$name"
+rollback=no
+printf '%s\n' "$mountpoint/$name"
